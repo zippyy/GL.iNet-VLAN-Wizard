@@ -1,5 +1,5 @@
 #!/bin/sh
-# Ultimate VLAN Wizard PRO
+# Ultimate VLAN Wizard
 # - Validation
 # - Dual-WAN aware
 # - Multi-radio Wi-Fi
