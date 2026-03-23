@@ -1,34 +1,42 @@
-# VLAN Wizard (CLI)
+# 📡 VLAN Wizard (CLI)
 
-Simple interactive script to create VLANs, Wi-Fi networks, DHCP, and firewall rules on GL.iNet / OpenWrt routers.
+> Simple VLAN + Wi-Fi automation script for GL.iNet / OpenWrt
 
-## Usage
+---
 
-chmod +x vlan-wizard.sh
-./vlan-wizard.sh
+## 🚀 Features
 
-Follow the prompts to:
-- Enter VLAN IDs
-- Set SSID names (optional)
-- Choose isolation
-- Assign ports
+- 🧩 Interactive VLAN setup  
+- 📶 Per-VLAN Wi-Fi (SSID)  
+- 🔒 Optional client isolation  
+- 🌐 Automatic DHCP + firewall rules  
+- 📡 Multi-radio Wi-Fi support  
+- ⚠️ Built-in validation (prevents bad configs)  
+- 💾 Auto backup + rollback safety  
+- 📁 Profile save/load  
 
-## What it does
+---
 
-- Creates VLAN interfaces (192.168.X.1)
-- Sets up DHCP + firewall per VLAN
-- Creates Wi-Fi SSIDs (if specified)
-- Uses LAN4 as trunk (tagged on all VLANs)
+## ⚙️ What It Does
 
-## Safety
+For each VLAN, the script will:
 
-- Validates config before applying
-- Auto backup + 60s rollback if something breaks
+- Create network interface (`192.168.X.1`)
+- Enable DHCP server  
+- Create isolated firewall zone  
+- Allow internet (WAN forwarding)  
+- Optionally create Wi-Fi network  
 
-## Notes
+---
 
-- Only one VLAN can be untagged per port
-- Do not assign WAN ports
-- No management VLAN enforcement (be careful)
+## 🔌 Port Layout
 
-Test on a non-production device first.
+- **LAN4 = trunk port (always tagged)**  
+- Other ports = access (untagged)  
+
+---
+
+## 📦 Installation
+
+```bash
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/zippyy/GL.iNet-VLAN-Wizard/main/install.sh)"
