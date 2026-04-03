@@ -99,14 +99,48 @@ detect_wan_ifaces() {
 	WAN_IFACES="$(trim_spaces "$WAN_IFACES")"
 }
 
+extract_lan_port_numbers() {
+	for token in $*; do
+		token="${token%%:*}"
+
+		case "$token" in
+			lan[0-9]*)
+				printf '%s\n' "${token#lan}"
+			;;
+		esac
+	done
+}
+
 detect_lan_ports() {
 	if [ "$MODE" = "dsa" ]; then
-		LAN_PORTS="$(ls /sys/class/net 2>/dev/null | grep -E '^lan[0-9]+$' | sed 's/^lan//' | sort -n || true)"
+		LAN_PORTS="$(
+			{
+				ls /sys/class/net 2>/dev/null | grep -E '^lan[0-9]+$' | sed 's/^lan//' || true
+
+				uci show network 2>/dev/null |
+					sed -n "s/.*\.ports='\([^']*\)'.*/\1/p" |
+					while read -r port_list; do
+						[ -n "$port_list" ] || continue
+						extract_lan_port_numbers $port_list
+					done
+
+				bridge vlan show 2>/dev/null |
+					awk 'NR>1 { print $1 }' |
+					while read -r port_name; do
+						[ -n "$port_name" ] || continue
+						extract_lan_port_numbers "$port_name"
+					done
+			} | sort -n -u
+		)"
 	else
 		LAN_PORTS="1 2 3 4"
 	fi
 
 	LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
+
+	if [ -z "$LAN_PORTS" ] && [ "$MODE" = "swconfig" ]; then
+		LAN_PORTS="1 2 3 4"
+	fi
 }
 
 detect_radios() {
