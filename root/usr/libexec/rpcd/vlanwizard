@@ -135,7 +135,6 @@ display_port_to_raw() {
 }
 
 detect_swconfig_ports() {
-	local_ports=""
 	primary_vlan=""
 	primary_ports=""
 	primary_untagged_count=0
@@ -159,14 +158,7 @@ detect_swconfig_ports() {
 
 			case "$token" in
 				*t*) ;;
-				*)
-					untagged_count=$((untagged_count + 1))
-					if [ "$vlan_id" = "$primary_vlan" ] || [ "$name" = "vlan_lan" ]; then
-						if ! contains_word "$base_port" $local_ports; then
-							local_ports="$local_ports $base_port"
-						fi
-					fi
-				;;
+				*) untagged_count=$((untagged_count + 1)) ;;
 			esac
 		done
 
@@ -186,6 +178,8 @@ detect_swconfig_ports() {
 	fi
 
 	if [ -n "$primary_ports" ]; then
+		LAN_PORTS=""
+
 		for token in $primary_ports; do
 			base_port="${token%%[a-zA-Z*]*}"
 			[ -n "$base_port" ] || continue
@@ -195,38 +189,25 @@ detect_swconfig_ports() {
 					RAW_TRUNK_PORT="$base_port"
 				;;
 				*)
-					if ! contains_word "$base_port" $local_ports; then
-						local_ports="$local_ports $base_port"
-					fi
-
 					if ! contains_word "$base_port" $RAW_LAN_PORTS; then
 						RAW_LAN_PORTS="$RAW_LAN_PORTS $base_port"
 						PORT_LABEL_MAP="$PORT_LABEL_MAP $label_index:$base_port"
+						LAN_PORTS="$LAN_PORTS $label_index"
 						label_index=$((label_index + 1))
 					fi
 				;;
 			esac
 		done
-	fi
 
-	if [ -n "$RAW_TRUNK_PORT" ]; then
-		PORT_LABEL_MAP="$PORT_LABEL_MAP $label_index:$RAW_TRUNK_PORT"
-		TRUNK_PORT="$label_index"
-	else
-		TRUNK_PORT="4"
+		if [ -n "$RAW_TRUNK_PORT" ]; then
+			PORT_LABEL_MAP="$PORT_LABEL_MAP $label_index:$RAW_TRUNK_PORT"
+			TRUNK_PORT="$label_index"
+		else
+			TRUNK_PORT="4"
+		fi
 	fi
 
 	RAW_LAN_PORTS="$(trim_spaces "$RAW_LAN_PORTS")"
-	LAN_PORTS=""
-	for mapping in $PORT_LABEL_MAP; do
-		label="${mapping%%:*}"
-		raw="${mapping#*:}"
-
-		if [ "$raw" != "$RAW_TRUNK_PORT" ]; then
-			LAN_PORTS="$LAN_PORTS $label"
-		fi
-	done
-
 	LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
 }
 
