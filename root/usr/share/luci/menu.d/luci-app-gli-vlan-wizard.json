@@ -1,0 +1,13 @@
+{
+	"admin/network/vlan-wizard": {
+		"title": "VLAN Wizard",
+		"order": 96,
+		"action": {
+			"type": "view",
+			"path": "vlan-wizard"
+		},
+		"depends": {
+			"acl": [ "luci-app-gli-vlan-wizard" ]
+		}
+	}
+}

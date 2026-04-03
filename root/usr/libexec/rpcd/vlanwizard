@@ -1,0 +1,870 @@
+#!/bin/sh
+
+set -e
+
+. /usr/share/libubox/jshn.sh
+
+PROFILE_DIR="/root/vlan_profiles"
+TRUNK_PORT="4"
+ROLLBACK_MARKER="/tmp/vlanwizard_rollback"
+ROLLBACK_BACKUP="/tmp/vlanwizard_rollback_backup"
+ROLLBACK_TIMEOUT=90
+
+MODE=""
+WAN_IFACES=""
+LAN_PORTS=""
+RAW_LAN_PORTS=""
+RAW_TRUNK_PORT=""
+PORT_LABEL_MAP=""
+RADIOS=""
+VALIDATION_ERRORS=""
+VALIDATION_WARNINGS=""
+LAST_BACKUP=""
+
+trim_spaces() {
+	echo "$1" | awk '{$1=$1; print}'
+}
+
+contains_word() {
+	needle="$1"
+	shift
+	for item in $*; do
+		[ "$item" = "$needle" ] && return 0
+	done
+	return 1
+}
+
+append_line() {
+	var_name="$1"
+	line="$2"
+	current_value="$(eval "printf '%s' \"\${$var_name-}\"")"
+	if [ -n "$current_value" ]; then
+		new_value="${current_value}
+$line"
+	else
+		new_value="$line"
+	fi
+	escaped_value="$(printf '%s' "$new_value" | sed "s/'/'\\\\''/g")"
+
+	eval "$var_name='$escaped_value'"
+}
+
+parse_entry() {
+	entry="$1"
+
+	case "$entry" in
+		*";"*";"*";"*)
+			ENTRY_VLAN="${entry%%;*}"
+			entry_rest="${entry#*;}"
+			ENTRY_SSID="${entry_rest%%;*}"
+			entry_rest="${entry_rest#*;}"
+			ENTRY_ISO="${entry_rest%%;*}"
+			ENTRY_UNTAG="${entry_rest#*;}"
+			ENTRY_UNTAG="$(trim_spaces "$ENTRY_UNTAG")"
+			return 0
+		;;
+	esac
+
+	return 1
+}
+
+split_config_entries() {
+	OLD_IFS="$IFS"
+	IFS='|'
+	set -- $1
+	IFS="$OLD_IFS"
+
+	for entry in "$@"; do
+		[ -n "$entry" ] || continue
+		printf '%s\n' "$entry"
+	done
+}
+
+detect_mode() {
+	if uci show network 2>/dev/null | grep -q "switch_vlan"; then
+		MODE="swconfig"
+	else
+		MODE="dsa"
+	fi
+}
+
+detect_wan_ifaces() {
+	WAN_IFACES=""
+
+	for net in wan wan6 wwan wan2 secondwan multiwan usbwan tethering modem lte; do
+		DEV="$(uci -q get network.$net.device || true)"
+		IFNAME="$(uci -q get network.$net.ifname || true)"
+
+		[ -n "$DEV" ] && WAN_IFACES="$WAN_IFACES $DEV"
+		[ -n "$IFNAME" ] && WAN_IFACES="$WAN_IFACES $IFNAME"
+	done
+
+	WAN_IFACES="$(trim_spaces "$WAN_IFACES")"
+}
+
+extract_lan_port_numbers() {
+	for token in $*; do
+		token="${token%%:*}"
+
+		case "$token" in
+			lan[0-9]*)
+				printf '%s\n' "${token#lan}"
+			;;
+		esac
+	done
+}
+
+display_port_to_raw() {
+	port="$1"
+
+	if [ "$MODE" != "swconfig" ]; then
+		printf '%s\n' "$port"
+		return
+	fi
+
+	for mapping in $PORT_LABEL_MAP; do
+		label="${mapping%%:*}"
+		raw="${mapping#*:}"
+		if [ "$label" = "$port" ]; then
+			printf '%s\n' "$raw"
+			return
+		fi
+	done
+
+	printf '%s\n' "$port"
+}
+
+detect_swconfig_ports() {
+	primary_vlan=""
+	primary_ports=""
+	primary_untagged_count=0
+	label_index=1
+
+	RAW_LAN_PORTS=""
+	PORT_LABEL_MAP=""
+	RAW_TRUNK_PORT=""
+
+	for sec in $(uci show network 2>/dev/null | grep "=switch_vlan" | cut -d. -f2 | cut -d= -f1); do
+		vlan_id="$(uci -q get network.$sec.vlan || true)"
+		port_list="$(uci -q get network.$sec.ports || true)"
+		name="$sec"
+		untagged_count=0
+
+		[ -n "$port_list" ] || continue
+
+		for token in $port_list; do
+			base_port="${token%%[a-zA-Z*]*}"
+			[ -n "$base_port" ] || continue
+
+			case "$token" in
+				*t*) ;;
+				*) untagged_count=$((untagged_count + 1)) ;;
+			esac
+		done
+
+		if [ "$name" = "vlan_lan" ]; then
+			primary_vlan="$vlan_id"
+			primary_ports="$port_list"
+			primary_untagged_count="$untagged_count"
+		elif [ -z "$primary_ports" ] || [ "$untagged_count" -gt "$primary_untagged_count" ]; then
+			primary_vlan="$vlan_id"
+			primary_ports="$port_list"
+			primary_untagged_count="$untagged_count"
+		fi
+	done
+
+	if [ -z "$primary_ports" ]; then
+		primary_ports="$(uci -q get network.vlan_lan.ports || true)"
+	fi
+
+	if [ -n "$primary_ports" ]; then
+		LAN_PORTS=""
+
+		for token in $primary_ports; do
+			base_port="${token%%[a-zA-Z*]*}"
+			[ -n "$base_port" ] || continue
+
+			case "$token" in
+				*t*)
+					RAW_TRUNK_PORT="$base_port"
+				;;
+				*)
+					if ! contains_word "$base_port" $RAW_LAN_PORTS; then
+						RAW_LAN_PORTS="$RAW_LAN_PORTS $base_port"
+						PORT_LABEL_MAP="$PORT_LABEL_MAP $label_index:$base_port"
+						LAN_PORTS="$LAN_PORTS $label_index"
+						label_index=$((label_index + 1))
+					fi
+				;;
+			esac
+		done
+
+		if [ -n "$RAW_TRUNK_PORT" ]; then
+			PORT_LABEL_MAP="$PORT_LABEL_MAP $label_index:$RAW_TRUNK_PORT"
+			TRUNK_PORT="$label_index"
+		else
+			TRUNK_PORT="4"
+		fi
+	fi
+
+	RAW_LAN_PORTS="$(trim_spaces "$RAW_LAN_PORTS")"
+	LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
+}
+
+detect_lan_ports() {
+	if [ "$MODE" = "dsa" ]; then
+		LAN_PORTS="$(
+			{
+				ls /sys/class/net 2>/dev/null | grep -E '^lan[0-9]+$' | sed 's/^lan//' || true
+
+				uci show network 2>/dev/null |
+					sed -n "s/.*\.ports='\([^']*\)'.*/\1/p" |
+					while read -r port_list; do
+						[ -n "$port_list" ] || continue
+						extract_lan_port_numbers $port_list
+					done
+
+				bridge vlan show 2>/dev/null |
+					awk 'NR>1 { print $1 }' |
+					while read -r port_name; do
+						[ -n "$port_name" ] || continue
+						extract_lan_port_numbers "$port_name"
+					done
+			} | sort -n -u
+		)"
+	else
+		detect_swconfig_ports
+	fi
+
+	LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
+	RAW_LAN_PORTS="$(trim_spaces "${RAW_LAN_PORTS-}")"
+
+	if [ -z "$LAN_PORTS" ] && [ "$MODE" = "swconfig" ]; then
+		LAN_PORTS="1 2 3"
+		TRUNK_PORT="4"
+		RAW_LAN_PORTS="1 2 3"
+		RAW_TRUNK_PORT="4"
+		PORT_LABEL_MAP="1:1 2:2 3:3 4:4"
+	fi
+
+	if [ -z "$RAW_TRUNK_PORT" ]; then
+		RAW_TRUNK_PORT="$TRUNK_PORT"
+	fi
+}
+
+detect_radios() {
+	RADIOS="$(uci show wireless 2>/dev/null | grep "=wifi-device" | cut -d. -f2 | cut -d= -f1 | sort -u || true)"
+	RADIOS="$(trim_spaces "$RADIOS")"
+}
+
+list_profiles_json() {
+	json_add_array profiles
+
+	if [ -d "$PROFILE_DIR" ]; then
+		for file in "$PROFILE_DIR"/*.conf; do
+			[ -e "$file" ] || continue
+			name="${file##*/}"
+			name="${name%.conf}"
+			json_add_string "" "$name"
+		done
+	fi
+
+	json_close_array
+}
+
+build_vlans_from_configs() {
+	input_configs="$1"
+	vlans=""
+	OLD_IFS="$IFS"
+	IFS='
+'
+	set -- $(split_config_entries "$input_configs")
+	IFS="$OLD_IFS"
+
+	for entry in "$@"; do
+		parse_entry "$entry" || continue
+		vlans="$vlans $ENTRY_VLAN"
+	done
+
+	trim_spaces "$vlans"
+}
+
+validate_profile_name() {
+	name="$1"
+
+	[ -z "$name" ] && return 0
+
+	case "$name" in
+		*[!A-Za-z0-9._-]*)
+			return 1
+		;;
+	esac
+
+	return 0
+}
+
+validate_configs() {
+	input_configs="$1"
+
+	VALIDATION_ERRORS=""
+	VALIDATION_WARNINGS=""
+	UNTAGGED_USED=""
+	SEEN_VLANS=""
+	SUBNETS=""
+	TOTAL_UNTAGGED_PORTS=0
+
+	OLD_IFS="$IFS"
+	IFS='
+'
+	set -- $(split_config_entries "$input_configs")
+	IFS="$OLD_IFS"
+
+	for entry in "$@"; do
+		if ! parse_entry "$entry"; then
+			append_line VALIDATION_ERRORS "Malformed VLAN entry: $entry"
+			continue
+		fi
+
+		v="$ENTRY_VLAN"
+		SSID="$ENTRY_SSID"
+		ISO="$ENTRY_ISO"
+		UNTAG="$ENTRY_UNTAG"
+
+		case "$v" in
+			''|*[!0-9]*)
+				append_line VALIDATION_ERRORS "Invalid VLAN ID: $v"
+				continue
+			;;
+		esac
+
+		if [ "$v" -lt 1 ] || [ "$v" -gt 4094 ]; then
+			append_line VALIDATION_ERRORS "VLAN $v out of range (1-4094)"
+		fi
+
+		if contains_word "$v" $SEEN_VLANS; then
+			append_line VALIDATION_ERRORS "Duplicate VLAN ID detected: $v"
+		else
+			SEEN_VLANS="$SEEN_VLANS $v"
+		fi
+
+		case "$ISO" in
+			y|n) ;;
+			*)
+				append_line VALIDATION_ERRORS "Invalid isolation value on VLAN $v: $ISO"
+			;;
+		esac
+
+		SUBNET="192.168.$v.0/24"
+		if contains_word "$SUBNET" $SUBNETS; then
+			append_line VALIDATION_ERRORS "Subnet conflict detected for VLAN $v ($SUBNET)"
+		else
+			SUBNETS="$SUBNETS $SUBNET"
+		fi
+
+		case "$SSID" in
+			*';'*|'|'*)
+				append_line VALIDATION_ERRORS "SSID for VLAN $v contains unsupported delimiter characters (; or |)"
+			;;
+		esac
+
+		if [ -n "$UNTAG" ]; then
+			for p in $UNTAG; do
+				raw_p="$p"
+
+				case "$p" in
+					''|*[!0-9]*)
+						append_line VALIDATION_ERRORS "VLAN $v has invalid port value: $p"
+						continue
+					;;
+				esac
+
+				if [ "$p" = "$TRUNK_PORT" ]; then
+					append_line VALIDATION_ERRORS "VLAN $v uses port $p as untagged, but port $TRUNK_PORT is reserved as trunk"
+					continue
+				fi
+
+				if ! contains_word "$p" $LAN_PORTS; then
+					append_line VALIDATION_ERRORS "VLAN $v references unknown LAN port: $p"
+				fi
+
+				if [ "$MODE" = "dsa" ]; then
+					if contains_word "lan$p" $WAN_IFACES; then
+						append_line VALIDATION_ERRORS "Port $p is mapped as WAN and cannot be used as LAN"
+					fi
+				else
+					raw_p="$(display_port_to_raw "$p")"
+					if echo " $WAN_IFACES " | grep -q " $raw_p "; then
+						append_line VALIDATION_ERRORS "Port $p may be a WAN-related interface; check mapping"
+					fi
+				fi
+
+				for used in $UNTAGGED_USED; do
+					used_port="${used#*:}"
+					used_vlan="${used%%:*}"
+					if [ "$p" = "$used_port" ]; then
+						append_line VALIDATION_ERRORS "Port $p is untagged in multiple VLANs ($used_vlan and $v)"
+					fi
+				done
+
+				UNTAGGED_USED="$UNTAGGED_USED $v:$p"
+				TOTAL_UNTAGGED_PORTS=$((TOTAL_UNTAGGED_PORTS + 1))
+			done
+		else
+			append_line VALIDATION_WARNINGS "VLAN $v has no untagged ports (trunk-only VLAN)"
+		fi
+	done
+
+	if [ "$TOTAL_UNTAGGED_PORTS" -eq 0 ]; then
+		append_line VALIDATION_WARNINGS "No untagged/access ports were assigned on any VLAN"
+	fi
+
+	if [ -z "$TRUNK_PORT" ]; then
+		append_line VALIDATION_ERRORS "No trunk port defined"
+	fi
+}
+
+configs_need_wifi_password() {
+	input_configs="$1"
+	OLD_IFS="$IFS"
+	IFS='
+'
+	set -- $(split_config_entries "$input_configs")
+	IFS="$OLD_IFS"
+
+	for entry in "$@"; do
+		parse_entry "$entry" || continue
+		[ -n "$ENTRY_SSID" ] && return 0
+	done
+
+	return 1
+}
+
+save_profile() {
+	vlans="$1"
+	input_configs="$2"
+	wifi_pass="$3"
+	save_name="$4"
+
+	[ -n "$save_name" ] || return 0
+
+	mkdir -p "$PROFILE_DIR"
+	{
+		echo "VLANS=\"$vlans\""
+		echo "CONFIGS=\"$input_configs\""
+		echo "WIFI_PASS=\"$wifi_pass\""
+	} > "$PROFILE_DIR/$save_name.conf"
+}
+
+create_backup() {
+	LAST_BACKUP="/root/vlan_backup_$(date +%s)"
+	mkdir -p "$LAST_BACKUP"
+	uci export network > "$LAST_BACKUP/network"
+	uci export wireless > "$LAST_BACKUP/wireless"
+	uci export firewall > "$LAST_BACKUP/firewall"
+	uci export dhcp > "$LAST_BACKUP/dhcp"
+}
+
+start_rollback_timer() {
+	backup="$1"
+
+	printf '%s' "$backup" > "$ROLLBACK_BACKUP"
+	touch "$ROLLBACK_MARKER"
+
+	(
+		sleep "$ROLLBACK_TIMEOUT"
+		if [ -f "$ROLLBACK_MARKER" ] && [ -f "$ROLLBACK_BACKUP" ]; then
+			backup_path="$(cat "$ROLLBACK_BACKUP" 2>/dev/null || true)"
+			if [ -n "$backup_path" ] && [ -d "$backup_path" ]; then
+				uci import network < "$backup_path/network"
+				uci import wireless < "$backup_path/wireless"
+				uci import firewall < "$backup_path/firewall"
+				uci import dhcp < "$backup_path/dhcp"
+				uci commit network
+				uci commit wireless
+				uci commit firewall
+				uci commit dhcp
+				/etc/init.d/network restart || true
+				/etc/init.d/firewall restart || true
+				/etc/init.d/dnsmasq restart || true
+				wifi reload || true
+			fi
+		fi
+
+		rm -f "$ROLLBACK_MARKER" "$ROLLBACK_BACKUP"
+	) >/dev/null 2>&1 &
+}
+
+cleanup_generated_wifi() {
+	for sec in $(uci show wireless 2>/dev/null | grep "=wifi-iface" | cut -d. -f2 | cut -d= -f1); do
+		case "$sec" in
+			vlan[0-9]*_*)
+				uci -q delete "wireless.$sec"
+			;;
+		esac
+	done
+}
+
+cleanup_vlan_sections() {
+	vlans="$1"
+
+	for v in $vlans; do
+		uci -q delete "firewall.vlan$v" || true
+		uci -q delete "dhcp.VLAN_$v" || true
+		uci -q delete "network.VLAN_$v" || true
+	done
+
+	for sec in $(uci show firewall 2>/dev/null | grep "=forwarding" | cut -d. -f2 | cut -d= -f1); do
+		src="$(uci -q get firewall.$sec.src || true)"
+		case "$src" in
+			VLAN_*)
+				vlan_id="${src#VLAN_}"
+				if contains_word "$vlan_id" $vlans; then
+					uci -q delete "firewall.$sec"
+				fi
+			;;
+		esac
+	done
+
+	for sec in $(uci show network 2>/dev/null | grep "=bridge-vlan" | cut -d. -f2 | cut -d= -f1); do
+		device="$(uci -q get network.$sec.device || true)"
+		vlan_id="$(uci -q get network.$sec.vlan || true)"
+		if [ "$device" = "br-lan" ] && contains_word "$vlan_id" $vlans; then
+			uci -q delete "network.$sec"
+		fi
+	done
+}
+
+apply_network() {
+	input_configs="$1"
+
+	if [ "$MODE" = "swconfig" ]; then
+		while uci -q delete network.@switch_vlan[0]; do :; done
+		OLD_IFS="$IFS"
+		IFS='
+'
+		set -- $(split_config_entries "$input_configs")
+		IFS="$OLD_IFS"
+
+		for entry in "$@"; do
+			parse_entry "$entry" || continue
+			v="$ENTRY_VLAN"
+			UNTAG="$ENTRY_UNTAG"
+			PORTS="6t ${RAW_TRUNK_PORT}t"
+
+			for p in $UNTAG; do
+				[ "$p" = "$TRUNK_PORT" ] && continue
+				raw_p="$(display_port_to_raw "$p")"
+				PORTS="$PORTS $raw_p"
+			done
+
+			uci add network switch_vlan >/dev/null
+			uci set network.@switch_vlan[-1].device='switch1'
+			uci set network.@switch_vlan[-1].vlan="$v"
+			uci set network.@switch_vlan[-1].ports="$PORTS"
+
+			uci set network.VLAN_$v='interface'
+			uci set network.VLAN_$v.type='bridge'
+			uci set network.VLAN_$v.ifname="eth1.$v"
+			uci set network.VLAN_$v.proto='static'
+			uci set network.VLAN_$v.ipaddr="192.168.$v.1"
+			uci set network.VLAN_$v.netmask='255.255.255.0'
+		done
+	else
+		OLD_IFS="$IFS"
+		IFS='
+'
+		set -- $(split_config_entries "$input_configs")
+		IFS="$OLD_IFS"
+
+		for entry in "$@"; do
+			parse_entry "$entry" || continue
+			v="$ENTRY_VLAN"
+			UNTAG="$ENTRY_UNTAG"
+
+			uci add network bridge-vlan >/dev/null
+			uci set network.@bridge-vlan[-1].device='br-lan'
+			uci set network.@bridge-vlan[-1].vlan="$v"
+			uci add_list network.@bridge-vlan[-1].ports="lan${TRUNK_PORT}:t"
+
+			FIRST=1
+			for p in $UNTAG; do
+				[ "$p" = "$TRUNK_PORT" ] && continue
+				if [ "$FIRST" = "1" ]; then
+					uci add_list network.@bridge-vlan[-1].ports="lan${p}:u*"
+					FIRST=0
+				else
+					uci add_list network.@bridge-vlan[-1].ports="lan${p}:u"
+				fi
+			done
+
+			uci set network.VLAN_$v='interface'
+			uci set network.VLAN_$v.device="br-lan.$v"
+			uci set network.VLAN_$v.proto='static'
+			uci set network.VLAN_$v.ipaddr="192.168.$v.1"
+			uci set network.VLAN_$v.netmask='255.255.255.0'
+		done
+	fi
+
+	uci commit network
+}
+
+apply_wifi() {
+	input_configs="$1"
+	wifi_pass="$2"
+
+	cleanup_generated_wifi
+	OLD_IFS="$IFS"
+	IFS='
+'
+	set -- $(split_config_entries "$input_configs")
+	IFS="$OLD_IFS"
+
+	for entry in "$@"; do
+		parse_entry "$entry" || continue
+		v="$ENTRY_VLAN"
+		SSID="$ENTRY_SSID"
+		ISO="$ENTRY_ISO"
+
+		[ -n "$SSID" ] || continue
+
+		for r in $RADIOS; do
+			IFACE="vlan${v}_${r}"
+
+			uci set wireless.$IFACE='wifi-iface'
+			uci set wireless.$IFACE.device="$r"
+			uci set wireless.$IFACE.network="VLAN_$v"
+			uci set wireless.$IFACE.mode='ap'
+			uci set wireless.$IFACE.ssid="$SSID"
+			uci set wireless.$IFACE.encryption='psk2'
+			uci set wireless.$IFACE.key="$wifi_pass"
+
+			if [ "$ISO" = "y" ]; then
+				uci set wireless.$IFACE.isolate='1'
+			else
+				uci -q delete wireless.$IFACE.isolate || true
+			fi
+		done
+	done
+
+	uci commit wireless
+}
+
+apply_firewall_and_dhcp() {
+	vlans="$1"
+
+	for v in $vlans; do
+		uci set firewall.vlan$v='zone'
+		uci set firewall.vlan$v.name="VLAN_$v"
+		uci set firewall.vlan$v.network="VLAN_$v"
+		uci set firewall.vlan$v.input='ACCEPT'
+		uci set firewall.vlan$v.forward='REJECT'
+		uci set firewall.vlan$v.output='ACCEPT'
+
+		uci add firewall forwarding >/dev/null
+		uci set firewall.@forwarding[-1].src="VLAN_$v"
+		uci set firewall.@forwarding[-1].dest='wan'
+
+		uci set dhcp.VLAN_$v='dhcp'
+		uci set dhcp.VLAN_$v.interface="VLAN_$v"
+		uci set dhcp.VLAN_$v.start='100'
+		uci set dhcp.VLAN_$v.limit='150'
+		uci set dhcp.VLAN_$v.leasetime='12h'
+		uci del_list dhcp.VLAN_$v.dhcp_option="6,192.168.$v.1" >/dev/null 2>&1 || true
+		uci add_list dhcp.VLAN_$v.dhcp_option="6,192.168.$v.1"
+	done
+
+	uci commit firewall
+	uci commit dhcp
+}
+
+restart_services() {
+	/etc/init.d/network restart
+	/etc/init.d/firewall restart || true
+	/etc/init.d/dnsmasq restart || true
+	wifi reload || true
+}
+
+emit_error_json() {
+	message="$1"
+	warnings="${2-}"
+
+	json_init
+	json_add_boolean ok 0
+	json_add_string message "$message"
+	[ -n "$warnings" ] && json_add_string warnings "$warnings"
+	json_dump
+}
+
+emit_success_json() {
+	message="$1"
+	backup="$2"
+	warnings="${3-}"
+	pending="${4-1}"
+
+	json_init
+	json_add_boolean ok 1
+	json_add_string message "$message"
+	json_add_string backup "$backup"
+	[ -n "$warnings" ] && json_add_string warnings "$warnings"
+	json_add_boolean rollback_pending "$pending"
+	json_dump
+}
+
+status_method() {
+	detect_mode
+	detect_wan_ifaces
+	detect_lan_ports
+	detect_radios
+
+	json_init
+	json_add_string mode "$MODE"
+	json_add_string trunk_port "$TRUNK_PORT"
+	json_add_boolean rollback_pending "$( [ -f "$ROLLBACK_MARKER" ] && echo 1 || echo 0 )"
+
+	json_add_array lan_ports
+	for port in $LAN_PORTS; do
+		json_add_string "" "$port"
+	done
+	json_close_array
+
+	json_add_array radios
+	for radio in $RADIOS; do
+		json_add_string "" "$radio"
+	done
+	json_close_array
+
+	list_profiles_json
+	json_dump
+}
+
+get_profile_method() {
+	name="$1"
+
+	if ! validate_profile_name "$name"; then
+		emit_error_json "Invalid profile name."
+		return
+	fi
+
+	path="$PROFILE_DIR/$name.conf"
+	if [ ! -f "$path" ]; then
+		emit_error_json "Profile not found."
+		return
+	fi
+
+	# shellcheck disable=SC1090
+	. "$path"
+
+	json_init
+	json_add_boolean ok 1
+	json_add_string configs "${CONFIGS-}"
+	json_add_string wifi_pass "${WIFI_PASS-}"
+	json_dump
+}
+
+apply_method() {
+	input_json="$1"
+
+	json_load "$input_json"
+	json_get_var configs configs
+	json_get_var wifi_pass wifi_pass
+	json_get_var save_profile_name save_profile
+	json_get_var load_profile_name load_profile
+
+	if [ -n "${load_profile_name-}" ]; then
+		if ! validate_profile_name "$load_profile_name"; then
+			emit_error_json "Invalid load profile name."
+			return
+		fi
+
+		profile_path="$PROFILE_DIR/$load_profile_name.conf"
+		if [ ! -f "$profile_path" ]; then
+			emit_error_json "Requested load profile does not exist."
+			return
+		fi
+
+		# shellcheck disable=SC1090
+		. "$profile_path"
+		configs="${CONFIGS-}"
+		wifi_pass="${WIFI_PASS-}"
+	fi
+
+	if ! validate_profile_name "${save_profile_name-}"; then
+		emit_error_json "Invalid save profile name. Use only letters, numbers, dot, dash, or underscore."
+		return
+	fi
+
+	if [ -z "${configs-}" ]; then
+		emit_error_json "No VLAN definitions were provided."
+		return
+	fi
+
+	detect_mode
+	detect_wan_ifaces
+	detect_lan_ports
+	detect_radios
+
+	vlans="$(build_vlans_from_configs "$configs")"
+	validate_configs "$configs"
+
+	if [ -n "$VALIDATION_ERRORS" ]; then
+		emit_error_json "$VALIDATION_ERRORS" "$VALIDATION_WARNINGS"
+		return
+	fi
+
+	if configs_need_wifi_password "$configs" && [ -z "${wifi_pass-}" ]; then
+		emit_error_json "A Wi-Fi password is required when any VLAN defines an SSID." "$VALIDATION_WARNINGS"
+		return
+	fi
+
+	create_backup
+	start_rollback_timer "$LAST_BACKUP"
+	save_profile "$vlans" "$configs" "${wifi_pass-}" "${save_profile_name-}"
+	cleanup_vlan_sections "$vlans"
+	apply_network "$configs"
+	apply_wifi "$configs" "${wifi_pass-}"
+	apply_firewall_and_dhcp "$vlans"
+	restart_services
+	emit_success_json "VLAN configuration applied. Confirm within 90 seconds to keep it." "$LAST_BACKUP" "$VALIDATION_WARNINGS" 1
+}
+
+confirm_method() {
+	rm -f "$ROLLBACK_MARKER" "$ROLLBACK_BACKUP"
+
+	json_init
+	json_add_boolean ok 1
+	json_add_string message "Rollback cancelled. Configuration kept."
+	json_add_boolean rollback_pending 0
+	json_dump
+}
+
+case "$1" in
+	list)
+		echo '{ "status": {}, "apply": { "configs": "String", "wifi_pass": "String", "save_profile": "String", "load_profile": "String" }, "confirm": {}, "get_profile": { "name": "String" } }'
+	;;
+	call)
+		method="${2-}"
+		payload="$(cat)"
+		case "$method" in
+			status)
+				status_method
+			;;
+			apply)
+				apply_method "$payload"
+			;;
+			confirm)
+				confirm_method
+			;;
+			get_profile)
+				json_load "$payload"
+				json_get_var name name
+				get_profile_method "${name-}"
+			;;
+			*)
+				emit_error_json "Unknown method."
+			;;
+		esac
+	;;
+	*)
+		exit 1
+	;;
+esac
