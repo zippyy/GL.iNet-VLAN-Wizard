@@ -111,6 +111,77 @@ extract_lan_port_numbers() {
 	done
 }
 
+detect_swconfig_ports() {
+	local_ports=""
+	tagged_ports=""
+	wan_ports=""
+	primary_vlan=""
+	primary_ports=""
+
+	for sec in $(uci show network 2>/dev/null | grep "=switch_vlan" | cut -d. -f2 | cut -d= -f1); do
+		vlan_id="$(uci -q get network.$sec.vlan || true)"
+		port_list="$(uci -q get network.$sec.ports || true)"
+		name="$sec"
+
+		[ -n "$port_list" ] || continue
+
+		case "$name" in
+			*vlan_lan*|*lan*)
+				primary_vlan="$vlan_id"
+				primary_ports="$port_list"
+			;;
+		esac
+
+		for token in $port_list; do
+			base_port="${token%%[a-zA-Z*]*}"
+			[ -n "$base_port" ] || continue
+
+			case "$token" in
+				*t*)
+					if ! contains_word "$base_port" $tagged_ports; then
+						tagged_ports="$tagged_ports $base_port"
+					fi
+				;;
+				*)
+					if [ "$vlan_id" = "$primary_vlan" ] || [ "$name" = "vlan_lan" ]; then
+						if ! contains_word "$base_port" $local_ports; then
+							local_ports="$local_ports $base_port"
+						fi
+					else
+						if ! contains_word "$base_port" $wan_ports; then
+							wan_ports="$wan_ports $base_port"
+						fi
+					fi
+				;;
+			esac
+		done
+	done
+
+	if [ -z "$primary_ports" ]; then
+		primary_ports="$(uci -q get network.vlan_lan.ports || true)"
+	fi
+
+	if [ -n "$primary_ports" ]; then
+		for token in $primary_ports; do
+			base_port="${token%%[a-zA-Z*]*}"
+			[ -n "$base_port" ] || continue
+
+			case "$token" in
+				*t*)
+					TRUNK_PORT="$base_port"
+				;;
+				*)
+					if ! contains_word "$base_port" $local_ports; then
+						local_ports="$local_ports $base_port"
+					fi
+				;;
+			esac
+		done
+	fi
+
+	LAN_PORTS="$(trim_spaces "$local_ports")"
+}
+
 detect_lan_ports() {
 	if [ "$MODE" = "dsa" ]; then
 		LAN_PORTS="$(
@@ -133,7 +204,7 @@ detect_lan_ports() {
 			} | sort -n -u
 		)"
 	else
-		LAN_PORTS="1 2 3 4"
+		detect_swconfig_ports
 	fi
 
 	LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
