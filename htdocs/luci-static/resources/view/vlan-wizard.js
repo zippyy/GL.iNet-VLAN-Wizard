@@ -12,7 +12,7 @@ var callStatus = rpc.declare({
 var callApply = rpc.declare({
 	object: 'vlanwizard',
 	method: 'apply',
-	params: [ 'configs', 'wifi_pass', 'save_profile', 'load_profile' ],
+	params: [ 'configs', 'wifi_pass', 'save_profile', 'load_profile', 'trunk_port' ],
 	expect: {}
 });
 
@@ -219,6 +219,8 @@ return view.extend({
 	render: function(status) {
 		var root = E('div', { 'class': 'vlan-wizard-shell' });
 		var heroMount = E('div');
+		var accessPortsMount = E('div', { 'class': 'vlan-chip-list' });
+		var allPortsMount = E('div', { 'class': 'vlan-chip-list' });
 		var rows = E('div', { 'class': 'vlan-rows' });
 		var summaryBox = E('div', { 'class': 'wizard-section-note vlan-summary-note' });
 		var saveProfile = E('input', {
@@ -236,12 +238,26 @@ return view.extend({
 			'type': 'password',
 			'placeholder': _('Wi-Fi password for any SSIDs you create')
 		});
+		var trunkSelect = E('select', { 'class': 'cbi-input-select' });
 		var preview = E('pre', { 'class': 'vlan-preview' }, _('No VLAN definitions yet.'));
 		var statusBox = E('div', { 'class': 'vlan-status-note' }, _('Ready.'));
 		var keepButton;
 		var ports = (status.lan_ports || []).map(String);
+		var allPorts = (status.all_ports || status.lan_ports || []).map(String);
 		var profiles = (status.profiles || []).map(String);
 		var trunkPort = text(status.trunk_port || '4');
+
+		allPorts.forEach(function(port) {
+			trunkSelect.appendChild(E('option', {
+				'value': port,
+				'selected': port === trunkPort ? 'selected' : null
+			}, portDisplayLabel(port)));
+		});
+
+		function updatePortLists() {
+			trunkPort = text(trunkSelect.value || trunkPort);
+			ports = allPorts.filter(function(port) { return port !== trunkPort; });
+		}
 
 		function renderSummary(entries) {
 			var wireless = countWirelessEntries(entries);
@@ -261,7 +277,14 @@ return view.extend({
 		}
 
 		function renderHeroState(entries) {
+			updatePortLists();
 			dom.content(heroMount, renderHero(status, entries, trunkPort, ports, profiles));
+			dom.content(accessPortsMount, ports.length ? ports.map(function(port) {
+				return E('span', { 'class': 'vlan-chip' }, portDisplayLabel(port));
+			}) : [ E('span', { 'class': 'vlan-chip' }, _('No LAN access ports available')) ]);
+			dom.content(allPortsMount, allPorts.length ? allPorts.map(function(port) {
+				return E('span', { 'class': 'vlan-chip' }, port === trunkPort ? _('%s (Trunk)').format(portDisplayLabel(port)) : portDisplayLabel(port));
+			}) : []);
 		}
 
 		function refreshPreview() {
@@ -354,6 +377,8 @@ return view.extend({
 				rows.innerHTML = '';
 				splitConfigs(reply.configs || '').forEach(addRow);
 				wifiPass.value = text(reply.wifi_pass || '');
+				if (reply.trunk_port)
+					trunkSelect.value = text(reply.trunk_port);
 				loadProfile.value = name;
 				if (!rows.children.length)
 					addRow();
@@ -387,7 +412,8 @@ return view.extend({
 				serializeConfigs(entries),
 				wifiPass.value,
 				text(saveProfile.value).trim(),
-				''
+				'',
+				text(trunkSelect.value).trim()
 			).then(function(reply) {
 				if (!reply || reply.ok !== true) {
 					setStatus(text(reply && reply.message) || _('Apply failed.'), 'error');
@@ -463,10 +489,15 @@ return view.extend({
 
 		root.appendChild(E('div', { 'class': 'vlan-panel' }, [
 			E('h3', {}, _('Device context')),
-			E('p', { 'class': 'wizard-section-note' }, _('Available LAN access ports are detected from the running device. Assign untagged ports with spaces such as "2 3". If the configurable LAN/WAN jack is currently acting as LAN, it will appear here as LAN1 automatically. Leave SSID blank for a wired-only VLAN, or leave Untagged ports blank for a trunk-only VLAN carried only on %s.').format(portDisplayLabel(trunkPort))),
-			E('div', { 'class': 'vlan-chip-list' }, ports.length ? ports.map(function(port) {
-				return E('span', { 'class': 'vlan-chip' }, portDisplayLabel(port));
-			}) : [ E('span', { 'class': 'vlan-chip' }, _('No LAN ports detected')) ]),
+			E('p', { 'class': 'wizard-section-note' }, _('Available LAN access ports are detected from the running device. Assign untagged ports with spaces such as "2 3". If the configurable LAN/WAN jack is currently acting as LAN, it will appear here as LAN1 automatically. Leave SSID blank for a wired-only VLAN, or leave Untagged ports blank for a trunk-only VLAN carried only on the selected trunk port.')),
+			E('div', { 'class': 'vlan-grid' }, [
+				E('label', { 'class': 'vlan-field' }, [
+					E('span', {}, _('Tagged trunk port')),
+					trunkSelect
+				])
+			]),
+			accessPortsMount,
+			allPortsMount,
 			E('div', { 'class': 'vlan-chip-list' }, profiles.length ? profiles.map(function(name) {
 				return E('span', { 'class': 'vlan-chip' }, name);
 			}) : [ E('span', { 'class': 'vlan-chip' }, _('No saved profiles yet')) ])
@@ -533,6 +564,7 @@ return view.extend({
 		]));
 
 		addRow();
+		trunkSelect.addEventListener('change', refreshPreview);
 		refreshPreview();
 
 		return root;

@@ -11,10 +11,13 @@ ROLLBACK_BACKUP="/tmp/vlanwizard_rollback_backup"
 ROLLBACK_TIMEOUT=90
 
 MODE=""
+BOARD_NAME=""
 WAN_IFACES=""
 LAN_PORTS=""
+ALL_LAN_PORTS=""
 RAW_LAN_PORTS=""
 RAW_TRUNK_PORT=""
+CPU_TAG_PORT="6"
 PORT_LABEL_MAP=""
 SWITCHABLE_RAW_PORT=""
 SWITCHABLE_PORT_ENABLED="0"
@@ -104,6 +107,18 @@ detect_wan_ifaces() {
 	WAN_IFACES="$(trim_spaces "$WAN_IFACES")"
 }
 
+detect_board_name() {
+	if [ -f /tmp/sysinfo/board_name ]; then
+		BOARD_NAME="$(cat /tmp/sysinfo/board_name 2>/dev/null || true)"
+	elif command -v ubus >/dev/null 2>&1; then
+		BOARD_NAME="$(ubus call system board 2>/dev/null | jsonfilter -e '@.board_name' 2>/dev/null || true)"
+	else
+		BOARD_NAME=""
+	fi
+
+	BOARD_NAME="$(trim_spaces "$BOARD_NAME")"
+}
+
 extract_lan_port_numbers() {
 	for token in $*; do
 		token="${token%%:*}"
@@ -136,7 +151,32 @@ display_port_to_raw() {
 	printf '%s\n' "$port"
 }
 
+raw_port_to_display() {
+	raw_port="$1"
+
+	if [ "$MODE" != "swconfig" ]; then
+		printf '%s\n' "$raw_port"
+		return
+	fi
+
+	for mapping in $PORT_LABEL_MAP; do
+		label="${mapping%%:*}"
+		raw="${mapping#*:}"
+		if [ "$raw" = "$raw_port" ]; then
+			printf '%s\n' "$label"
+			return
+		fi
+	done
+
+	printf '%s\n' "$raw_port"
+}
+
 detect_swconfig_ports() {
+	if [ "$BOARD_NAME" = "qcom,ipq5332-ap-mi01.6" ]; then
+		detect_be9300_swconfig_ports
+		return
+	fi
+
 	primary_vlan=""
 	primary_ports=""
 	primary_untagged_count=0
@@ -256,7 +296,59 @@ detect_swconfig_ports() {
 	LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
 }
 
+detect_be9300_swconfig_ports() {
+	primary_ports="$(uci -q get network.vlan_lan.ports || true)"
+	CPU_TAG_PORT="3"
+	SWITCHABLE_RAW_PORT="7"
+	PORT_LABEL_MAP="1:7 2:6 3:5 4:4"
+	ALL_LAN_PORTS=""
+	LAN_PORTS=""
+	RAW_LAN_PORTS=""
+	RAW_TRUNK_PORT=""
+	SWITCHABLE_PORT_ENABLED="0"
+
+	for raw_port in 7 6 5 4; do
+		if echo " $primary_ports " | grep -q " $raw_port "; then
+			label="$(raw_port_to_display "$raw_port")"
+			ALL_LAN_PORTS="$ALL_LAN_PORTS $label"
+			if [ "$raw_port" = "$SWITCHABLE_RAW_PORT" ]; then
+				SWITCHABLE_PORT_ENABLED="1"
+			fi
+		fi
+	done
+
+	for token in $primary_ports; do
+		case "$token" in
+			*t*)
+				raw_tag="${token%%[a-zA-Z*]*}"
+				[ "$raw_tag" = "$CPU_TAG_PORT" ] && continue
+				RAW_TRUNK_PORT="$raw_tag"
+			;;
+		esac
+	done
+
+	if [ -n "$RAW_TRUNK_PORT" ]; then
+		TRUNK_PORT="$(raw_port_to_display "$RAW_TRUNK_PORT")"
+	else
+		TRUNK_PORT="4"
+		RAW_TRUNK_PORT="$(display_port_to_raw "$TRUNK_PORT")"
+	fi
+
+	for label in $ALL_LAN_PORTS; do
+		if [ "$label" != "$TRUNK_PORT" ]; then
+			LAN_PORTS="$LAN_PORTS $label"
+			RAW_LAN_PORTS="$RAW_LAN_PORTS $(display_port_to_raw "$label")"
+		fi
+	done
+
+	ALL_LAN_PORTS="$(trim_spaces "$ALL_LAN_PORTS")"
+	LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
+	RAW_LAN_PORTS="$(trim_spaces "$RAW_LAN_PORTS")"
+}
+
 detect_lan_ports() {
+	detect_board_name
+
 	if [ "$MODE" = "dsa" ]; then
 		LAN_PORTS="$(
 			{
@@ -282,6 +374,7 @@ detect_lan_ports() {
 	fi
 
 	LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
+	ALL_LAN_PORTS="$(trim_spaces "${ALL_LAN_PORTS-$LAN_PORTS}")"
 	RAW_LAN_PORTS="$(trim_spaces "${RAW_LAN_PORTS-}")"
 
 	if [ -z "$LAN_PORTS" ] && [ "$MODE" = "swconfig" ]; then
@@ -495,6 +588,7 @@ save_profile() {
 	input_configs="$2"
 	wifi_pass="$3"
 	save_name="$4"
+	trunk_port="$5"
 
 	[ -n "$save_name" ] || return 0
 
@@ -503,6 +597,7 @@ save_profile() {
 		echo "VLANS=\"$vlans\""
 		echo "CONFIGS=\"$input_configs\""
 		echo "WIFI_PASS=\"$wifi_pass\""
+		echo "TRUNK_PORT_LABEL=\"$trunk_port\""
 	} > "$PROFILE_DIR/$save_name.conf"
 }
 
@@ -600,7 +695,7 @@ apply_network() {
 			parse_entry "$entry" || continue
 			v="$ENTRY_VLAN"
 			UNTAG="$ENTRY_UNTAG"
-			PORTS="6t ${RAW_TRUNK_PORT}t"
+			PORTS="${CPU_TAG_PORT}t ${RAW_TRUNK_PORT}t"
 
 			for p in $UNTAG; do
 				[ "$p" = "$TRUNK_PORT" ] && continue
@@ -769,11 +864,18 @@ status_method() {
 
 	json_init
 	json_add_string mode "$MODE"
+	json_add_string board_name "$BOARD_NAME"
 	json_add_string trunk_port "$TRUNK_PORT"
 	json_add_boolean rollback_pending "$( [ -f "$ROLLBACK_MARKER" ] && echo 1 || echo 0 )"
 
 	json_add_array lan_ports
 	for port in $LAN_PORTS; do
+		json_add_string "" "$port"
+	done
+	json_close_array
+
+	json_add_array all_ports
+	for port in $ALL_LAN_PORTS; do
 		json_add_string "" "$port"
 	done
 	json_close_array
@@ -809,6 +911,7 @@ get_profile_method() {
 	json_add_boolean ok 1
 	json_add_string configs "${CONFIGS-}"
 	json_add_string wifi_pass "${WIFI_PASS-}"
+	json_add_string trunk_port "${TRUNK_PORT_LABEL-${TRUNK_PORT-}}"
 	json_dump
 }
 
@@ -820,6 +923,7 @@ apply_method() {
 	json_get_var wifi_pass wifi_pass
 	json_get_var save_profile_name save_profile
 	json_get_var load_profile_name load_profile
+	json_get_var requested_trunk_port trunk_port
 
 	if [ -n "${load_profile_name-}" ]; then
 		if ! validate_profile_name "$load_profile_name"; then
@@ -837,6 +941,7 @@ apply_method() {
 		. "$profile_path"
 		configs="${CONFIGS-}"
 		wifi_pass="${WIFI_PASS-}"
+		requested_trunk_port="${TRUNK_PORT_LABEL-${requested_trunk_port-}}"
 	fi
 
 	if ! validate_profile_name "${save_profile_name-}"; then
@@ -854,6 +959,26 @@ apply_method() {
 	detect_lan_ports
 	detect_radios
 
+	if [ -n "${requested_trunk_port-}" ]; then
+		if ! contains_word "$requested_trunk_port" $ALL_LAN_PORTS; then
+			emit_error_json "Selected trunk port is not available in the current LAN layout."
+			return
+		fi
+
+		TRUNK_PORT="$requested_trunk_port"
+		RAW_TRUNK_PORT="$(display_port_to_raw "$TRUNK_PORT")"
+		LAN_PORTS=""
+		RAW_LAN_PORTS=""
+		for port in $ALL_LAN_PORTS; do
+			if [ "$port" != "$TRUNK_PORT" ]; then
+				LAN_PORTS="$LAN_PORTS $port"
+				RAW_LAN_PORTS="$RAW_LAN_PORTS $(display_port_to_raw "$port")"
+			fi
+		done
+		LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
+		RAW_LAN_PORTS="$(trim_spaces "$RAW_LAN_PORTS")"
+	fi
+
 	vlans="$(build_vlans_from_configs "$configs")"
 	validate_configs "$configs"
 
@@ -869,7 +994,7 @@ apply_method() {
 
 	create_backup
 	start_rollback_timer "$LAST_BACKUP"
-	save_profile "$vlans" "$configs" "${wifi_pass-}" "${save_profile_name-}"
+	save_profile "$vlans" "$configs" "${wifi_pass-}" "${save_profile_name-}" "$TRUNK_PORT"
 	cleanup_vlan_sections "$vlans"
 	apply_network "$configs"
 	apply_wifi "$configs" "${wifi_pass-}"
@@ -890,7 +1015,7 @@ confirm_method() {
 
 case "$1" in
 	list)
-		echo '{ "status": {}, "apply": { "configs": "String", "wifi_pass": "String", "save_profile": "String", "load_profile": "String" }, "confirm": {}, "get_profile": { "name": "String" } }'
+		echo '{ "status": {}, "apply": { "configs": "String", "wifi_pass": "String", "save_profile": "String", "load_profile": "String", "trunk_port": "String" }, "confirm": {}, "get_profile": { "name": "String" } }'
 	;;
 	call)
 		method="${2-}"
