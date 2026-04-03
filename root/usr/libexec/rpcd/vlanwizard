@@ -13,6 +13,9 @@ ROLLBACK_TIMEOUT=90
 MODE=""
 WAN_IFACES=""
 LAN_PORTS=""
+RAW_LAN_PORTS=""
+RAW_TRUNK_PORT=""
+PORT_LABEL_MAP=""
 RADIOS=""
 VALIDATION_ERRORS=""
 VALIDATION_WARNINGS=""
@@ -111,12 +114,35 @@ extract_lan_port_numbers() {
 	done
 }
 
+display_port_to_raw() {
+	port="$1"
+
+	if [ "$MODE" != "swconfig" ]; then
+		printf '%s\n' "$port"
+		return
+	fi
+
+	for mapping in $PORT_LABEL_MAP; do
+		label="${mapping%%:*}"
+		raw="${mapping#*:}"
+		if [ "$label" = "$port" ]; then
+			printf '%s\n' "$raw"
+			return
+		fi
+	done
+
+	printf '%s\n' "$port"
+}
+
 detect_swconfig_ports() {
 	local_ports=""
-	tagged_ports=""
-	wan_ports=""
 	primary_vlan=""
 	primary_ports=""
+	label_index=1
+
+	RAW_LAN_PORTS=""
+	PORT_LABEL_MAP=""
+	RAW_TRUNK_PORT=""
 
 	for sec in $(uci show network 2>/dev/null | grep "=switch_vlan" | cut -d. -f2 | cut -d= -f1); do
 		vlan_id="$(uci -q get network.$sec.vlan || true)"
@@ -137,19 +163,11 @@ detect_swconfig_ports() {
 			[ -n "$base_port" ] || continue
 
 			case "$token" in
-				*t*)
-					if ! contains_word "$base_port" $tagged_ports; then
-						tagged_ports="$tagged_ports $base_port"
-					fi
-				;;
+				*t*) ;;
 				*)
 					if [ "$vlan_id" = "$primary_vlan" ] || [ "$name" = "vlan_lan" ]; then
 						if ! contains_word "$base_port" $local_ports; then
 							local_ports="$local_ports $base_port"
-						fi
-					else
-						if ! contains_word "$base_port" $wan_ports; then
-							wan_ports="$wan_ports $base_port"
 						fi
 					fi
 				;;
@@ -168,18 +186,42 @@ detect_swconfig_ports() {
 
 			case "$token" in
 				*t*)
-					TRUNK_PORT="$base_port"
+					RAW_TRUNK_PORT="$base_port"
 				;;
 				*)
 					if ! contains_word "$base_port" $local_ports; then
 						local_ports="$local_ports $base_port"
+					fi
+
+					if ! contains_word "$base_port" $RAW_LAN_PORTS; then
+						RAW_LAN_PORTS="$RAW_LAN_PORTS $base_port"
+						PORT_LABEL_MAP="$PORT_LABEL_MAP $label_index:$base_port"
+						label_index=$((label_index + 1))
 					fi
 				;;
 			esac
 		done
 	fi
 
-	LAN_PORTS="$(trim_spaces "$local_ports")"
+	if [ -n "$RAW_TRUNK_PORT" ]; then
+		PORT_LABEL_MAP="$PORT_LABEL_MAP $label_index:$RAW_TRUNK_PORT"
+		TRUNK_PORT="$label_index"
+	else
+		TRUNK_PORT="4"
+	fi
+
+	RAW_LAN_PORTS="$(trim_spaces "$RAW_LAN_PORTS")"
+	LAN_PORTS=""
+	for mapping in $PORT_LABEL_MAP; do
+		label="${mapping%%:*}"
+		raw="${mapping#*:}"
+
+		if [ "$raw" != "$RAW_TRUNK_PORT" ]; then
+			LAN_PORTS="$LAN_PORTS $label"
+		fi
+	done
+
+	LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
 }
 
 detect_lan_ports() {
@@ -208,9 +250,18 @@ detect_lan_ports() {
 	fi
 
 	LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
+	RAW_LAN_PORTS="$(trim_spaces "${RAW_LAN_PORTS-}")"
 
 	if [ -z "$LAN_PORTS" ] && [ "$MODE" = "swconfig" ]; then
-		LAN_PORTS="1 2 3 4"
+		LAN_PORTS="1 2 3"
+		TRUNK_PORT="4"
+		RAW_LAN_PORTS="1 2 3"
+		RAW_TRUNK_PORT="4"
+		PORT_LABEL_MAP="1:1 2:2 3:3 4:4"
+	fi
+
+	if [ -z "$RAW_TRUNK_PORT" ]; then
+		RAW_TRUNK_PORT="$TRUNK_PORT"
 	fi
 }
 
@@ -331,6 +382,8 @@ validate_configs() {
 
 		if [ -n "$UNTAG" ]; then
 			for p in $UNTAG; do
+				raw_p="$p"
+
 				case "$p" in
 					''|*[!0-9]*)
 						append_line VALIDATION_ERRORS "VLAN $v has invalid port value: $p"
@@ -352,7 +405,8 @@ validate_configs() {
 						append_line VALIDATION_ERRORS "Port $p is mapped as WAN and cannot be used as LAN"
 					fi
 				else
-					if echo " $WAN_IFACES " | grep -q " $p "; then
+					raw_p="$(display_port_to_raw "$p")"
+					if echo " $WAN_IFACES " | grep -q " $raw_p "; then
 						append_line VALIDATION_ERRORS "Port $p may be a WAN-related interface; check mapping"
 					fi
 				fi
@@ -508,11 +562,12 @@ apply_network() {
 			parse_entry "$entry" || continue
 			v="$ENTRY_VLAN"
 			UNTAG="$ENTRY_UNTAG"
-			PORTS="6t ${TRUNK_PORT}t"
+			PORTS="6t ${RAW_TRUNK_PORT}t"
 
 			for p in $UNTAG; do
 				[ "$p" = "$TRUNK_PORT" ] && continue
-				PORTS="$PORTS $p"
+				raw_p="$(display_port_to_raw "$p")"
+				PORTS="$PORTS $raw_p"
 			done
 
 			uci add network switch_vlan >/dev/null
