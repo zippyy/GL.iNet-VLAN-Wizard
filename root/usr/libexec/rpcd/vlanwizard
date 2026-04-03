@@ -25,6 +25,7 @@ RADIOS=""
 VALIDATION_ERRORS=""
 VALIDATION_WARNINGS=""
 LAST_BACKUP=""
+PLAN_SUMMARY=""
 
 trim_spaces() {
 	echo "$1" | awk '{$1=$1; print}'
@@ -52,6 +53,23 @@ $line"
 	escaped_value="$(printf '%s' "$new_value" | sed "s/'/'\\\\''/g")"
 
 	eval "$var_name='$escaped_value'"
+}
+
+json_add_lines_array() {
+	key="$1"
+	value="$2"
+	OLD_IFS="$IFS"
+	IFS='
+'
+	set -- $value
+	IFS="$OLD_IFS"
+
+	json_add_array "$key"
+	for line in "$@"; do
+		[ -n "$line" ] || continue
+		json_add_string "" "$line"
+	done
+	json_close_array
 }
 
 parse_entry() {
@@ -559,12 +577,48 @@ validate_configs() {
 	done
 
 	if [ "$TOTAL_UNTAGGED_PORTS" -eq 0 ]; then
-		append_line VALIDATION_WARNINGS "No untagged/access ports were assigned on any VLAN"
+		append_line VALIDATION_ERRORS "No untagged/access ports were assigned on any VLAN. Refusing to apply because this would remove the local management path."
 	fi
 
 	if [ -z "$TRUNK_PORT" ]; then
 		append_line VALIDATION_ERRORS "No trunk port defined"
 	fi
+}
+
+build_plan_summary() {
+	input_configs="$1"
+	PLAN_SUMMARY=""
+	OLD_IFS="$IFS"
+	IFS='
+'
+	set -- $(split_config_entries "$input_configs")
+	IFS="$OLD_IFS"
+
+	append_line PLAN_SUMMARY "Mode: $MODE"
+	append_line PLAN_SUMMARY "Board: ${BOARD_NAME:-unknown}"
+	append_line PLAN_SUMMARY "Selected trunk: LAN$TRUNK_PORT (raw $RAW_TRUNK_PORT)"
+
+	for entry in "$@"; do
+		parse_entry "$entry" || continue
+		v="$ENTRY_VLAN"
+		SSID="$ENTRY_SSID"
+		UNTAG="$ENTRY_UNTAG"
+
+		if [ "$MODE" = "swconfig" ]; then
+			ports_preview="${CPU_TAG_PORT}t ${RAW_TRUNK_PORT}t"
+			display_ports=""
+			for p in $UNTAG; do
+				raw_p="$(display_port_to_raw "$p")"
+				ports_preview="$ports_preview $raw_p"
+				display_ports="$display_ports LAN$p"
+			done
+			ports_preview="$(trim_spaces "$ports_preview")"
+			display_ports="$(trim_spaces "$display_ports")"
+			append_line PLAN_SUMMARY "VLAN $v -> switch1 ports: $ports_preview | access: ${display_ports:-none} | SSID: ${SSID:-none}"
+		else
+			append_line PLAN_SUMMARY "VLAN $v -> br-lan.$v | access: ${UNTAG:-none} | SSID: ${SSID:-none}"
+		fi
+	done
 }
 
 configs_need_wifi_password() {
@@ -830,6 +884,13 @@ restart_services() {
 	wifi reload || true
 }
 
+restart_services_async() {
+	(
+		sleep 2
+		restart_services
+	) >/dev/null 2>&1 &
+}
+
 emit_error_json() {
 	message="$1"
 	warnings="${2-}"
@@ -853,6 +914,21 @@ emit_success_json() {
 	json_add_string backup "$backup"
 	[ -n "$warnings" ] && json_add_string warnings "$warnings"
 	json_add_boolean rollback_pending "$pending"
+	json_dump
+}
+
+emit_preview_json() {
+	warnings="${1-}"
+
+	json_init
+	json_add_boolean ok 1
+	json_add_string mode "$MODE"
+	json_add_string board_name "$BOARD_NAME"
+	json_add_string trunk_port "$TRUNK_PORT"
+	json_add_string raw_trunk_port "$RAW_TRUNK_PORT"
+	json_add_string cpu_tag_port "$CPU_TAG_PORT"
+	json_add_lines_array summary "$PLAN_SUMMARY"
+	[ -n "$warnings" ] && json_add_string warnings "$warnings"
 	json_dump
 }
 
@@ -913,6 +989,53 @@ get_profile_method() {
 	json_add_string wifi_pass "${WIFI_PASS-}"
 	json_add_string trunk_port "${TRUNK_PORT_LABEL-${TRUNK_PORT-}}"
 	json_dump
+}
+
+preview_method() {
+	input_json="$1"
+
+	json_load "$input_json"
+	json_get_var configs configs
+	json_get_var trunk_port trunk_port
+
+	if [ -z "${configs-}" ]; then
+		emit_error_json "No VLAN definitions were provided."
+		return
+	fi
+
+	detect_mode
+	detect_wan_ifaces
+	detect_lan_ports
+	detect_radios
+
+	if [ -n "${trunk_port-}" ]; then
+		if ! contains_word "$trunk_port" $ALL_LAN_PORTS; then
+			emit_error_json "Selected trunk port is not available in the current LAN layout."
+			return
+		fi
+
+		TRUNK_PORT="$trunk_port"
+		RAW_TRUNK_PORT="$(display_port_to_raw "$TRUNK_PORT")"
+		LAN_PORTS=""
+		RAW_LAN_PORTS=""
+		for port in $ALL_LAN_PORTS; do
+			if [ "$port" != "$TRUNK_PORT" ]; then
+				LAN_PORTS="$LAN_PORTS $port"
+				RAW_LAN_PORTS="$RAW_LAN_PORTS $(display_port_to_raw "$port")"
+			fi
+		done
+		LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
+		RAW_LAN_PORTS="$(trim_spaces "$RAW_LAN_PORTS")"
+	fi
+
+	validate_configs "$configs"
+	if [ -n "$VALIDATION_ERRORS" ]; then
+		emit_error_json "$VALIDATION_ERRORS" "$VALIDATION_WARNINGS"
+		return
+	fi
+
+	build_plan_summary "$configs"
+	emit_preview_json "$VALIDATION_WARNINGS"
 }
 
 apply_method() {
@@ -999,8 +1122,9 @@ apply_method() {
 	apply_network "$configs"
 	apply_wifi "$configs" "${wifi_pass-}"
 	apply_firewall_and_dhcp "$vlans"
-	restart_services
-	emit_success_json "VLAN configuration applied. Confirm within 90 seconds to keep it." "$LAST_BACKUP" "$VALIDATION_WARNINGS" 1
+	build_plan_summary "$configs"
+	restart_services_async
+	emit_success_json "VLAN configuration staged. Services will restart in the background; reconnect and confirm within 90 seconds to keep it." "$LAST_BACKUP" "$VALIDATION_WARNINGS" 1
 }
 
 confirm_method() {
@@ -1015,7 +1139,7 @@ confirm_method() {
 
 case "$1" in
 	list)
-		echo '{ "status": {}, "apply": { "configs": "String", "wifi_pass": "String", "save_profile": "String", "load_profile": "String", "trunk_port": "String" }, "confirm": {}, "get_profile": { "name": "String" } }'
+		echo '{ "status": {}, "preview": { "configs": "String", "trunk_port": "String" }, "apply": { "configs": "String", "wifi_pass": "String", "save_profile": "String", "load_profile": "String", "trunk_port": "String" }, "confirm": {}, "get_profile": { "name": "String" } }'
 	;;
 	call)
 		method="${2-}"
@@ -1023,6 +1147,9 @@ case "$1" in
 		case "$method" in
 			status)
 				status_method
+			;;
+			preview)
+				preview_method "$payload"
 			;;
 			apply)
 				apply_method "$payload"

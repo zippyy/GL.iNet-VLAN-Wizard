@@ -16,6 +16,13 @@ var callApply = rpc.declare({
 	expect: {}
 });
 
+var callPreview = rpc.declare({
+	object: 'vlanwizard',
+	method: 'preview',
+	params: [ 'configs', 'trunk_port' ],
+	expect: {}
+});
+
 var callConfirm = rpc.declare({
 	object: 'vlanwizard',
 	method: 'confirm',
@@ -240,6 +247,7 @@ return view.extend({
 		});
 		var trunkSelect = E('select', { 'class': 'cbi-input-select' });
 		var preview = E('pre', { 'class': 'vlan-preview' }, _('No VLAN definitions yet.'));
+		var planBox = E('pre', { 'class': 'vlan-preview' }, _('Run Preview plan to inspect the raw switch-port changes before apply.'));
 		var statusBox = E('div', { 'class': 'vlan-status-note' }, _('Ready.'));
 		var keepButton;
 		var ports = (status.lan_ports || []).map(String);
@@ -432,6 +440,38 @@ return view.extend({
 			});
 		}
 
+		function previewPlan() {
+			var entries = collectRows(rows).filter(function(entry) {
+				return text(entry.vlan).trim() !== '' || text(entry.ssid).trim() !== '' || text(entry.untagged).trim() !== '';
+			});
+			var errors = validateEntries(entries, ports, trunkPort);
+
+			if (!entries.length)
+				errors.unshift(_('Add at least one VLAN row before previewing.'));
+
+			if (errors.length) {
+				setStatus(errors.join(' '), 'error');
+				return;
+			}
+
+			setStatus(_('Building raw switch-port preview...'));
+
+			callPreview(
+				serializeConfigs(entries),
+				text(trunkSelect.value).trim()
+			).then(function(reply) {
+				if (!reply || reply.ok !== true) {
+					setStatus(text(reply && reply.message) || _('Preview failed.'), 'error');
+					return;
+				}
+
+				planBox.textContent = Array.isArray(reply.summary) ? reply.summary.join('\n') : _('No preview details returned.');
+				setStatus(reply.warnings ? _('Preview ready. %s').format(reply.warnings) : _('Preview ready.'), 'success');
+			}).catch(function(err) {
+				setStatus(_('Preview failed: %s').format(err.message || err), 'error');
+			});
+		}
+
 		keepButton = E('button', {
 			'class': 'btn cbi-button cbi-button-save',
 			'disabled': !status.rollback_pending,
@@ -548,9 +588,17 @@ return view.extend({
 
 		root.appendChild(E('div', { 'class': 'vlan-panel' }, [
 			E('h3', {}, _('Preview')),
-			E('p', { 'class': 'wizard-section-note' }, _('Review the staged VLAN plan before apply. The backend still revalidates VLAN IDs, access-port conflicts, reserved trunk usage, and required Wi-Fi credentials before changing UCI config.')),
+			E('p', { 'class': 'wizard-section-note' }, _('Review the staged VLAN plan before apply. Preview shows the raw switch or bridge port writes the backend will make, including the detected CPU tag and selected trunk. Apply revalidates the same rules before writing config.')),
 			preview,
+			planBox,
 			E('div', { 'class': 'vlan-actions' }, [
+				E('button', {
+					'class': 'btn cbi-button cbi-button-action',
+					'click': function(ev) {
+						ev.preventDefault();
+						previewPlan();
+					}
+				}, [ _('Preview plan') ]),
 				E('button', {
 					'class': 'btn cbi-button cbi-button-apply',
 					'click': function(ev) {
