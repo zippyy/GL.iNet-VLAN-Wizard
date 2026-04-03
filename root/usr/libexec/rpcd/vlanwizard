@@ -138,6 +138,7 @@ detect_swconfig_ports() {
 	local_ports=""
 	primary_vlan=""
 	primary_ports=""
+	primary_untagged_count=0
 	label_index=1
 
 	RAW_LAN_PORTS=""
@@ -148,15 +149,9 @@ detect_swconfig_ports() {
 		vlan_id="$(uci -q get network.$sec.vlan || true)"
 		port_list="$(uci -q get network.$sec.ports || true)"
 		name="$sec"
+		untagged_count=0
 
 		[ -n "$port_list" ] || continue
-
-		case "$name" in
-			*vlan_lan*|*lan*)
-				primary_vlan="$vlan_id"
-				primary_ports="$port_list"
-			;;
-		esac
 
 		for token in $port_list; do
 			base_port="${token%%[a-zA-Z*]*}"
@@ -165,6 +160,7 @@ detect_swconfig_ports() {
 			case "$token" in
 				*t*) ;;
 				*)
+					untagged_count=$((untagged_count + 1))
 					if [ "$vlan_id" = "$primary_vlan" ] || [ "$name" = "vlan_lan" ]; then
 						if ! contains_word "$base_port" $local_ports; then
 							local_ports="$local_ports $base_port"
@@ -173,6 +169,16 @@ detect_swconfig_ports() {
 				;;
 			esac
 		done
+
+		if [ "$name" = "vlan_lan" ]; then
+			primary_vlan="$vlan_id"
+			primary_ports="$port_list"
+			primary_untagged_count="$untagged_count"
+		elif [ -z "$primary_ports" ] || [ "$untagged_count" -gt "$primary_untagged_count" ]; then
+			primary_vlan="$vlan_id"
+			primary_ports="$port_list"
+			primary_untagged_count="$untagged_count"
+		fi
 	done
 
 	if [ -z "$primary_ports" ]; then
