@@ -1,0 +1,15 @@
+{
+	"luci-app-gli-vlan-wizard": {
+		"description": "Grant access to the GL.iNet VLAN Wizard",
+		"read": {
+			"ubus": {
+				"vlanwizard": [ "status", "get_profile" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"vlanwizard": [ "apply", "confirm" ]
+			}
+		}
+	}
+}

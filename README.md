@@ -1,42 +1,46 @@
-# 📡 VLAN Wizard (CLI)
+# VLAN Wizard
 
-> Simple VLAN + Wi-Fi automation script for GL.iNet / OpenWrt
+> Simple VLAN + Wi-Fi automation for GL.iNet / OpenWrt
 
----
+## Features
 
-## 🚀 Features
+- Interactive CLI VLAN setup
+- LuCI web GUI on the `feature/luci-plugin` branch
+- Per-VLAN Wi-Fi SSIDs
+- Optional client isolation
+- Automatic DHCP and firewall rules
+- Multi-radio Wi-Fi support
+- Validation for VLAN IDs and port conflicts
+- Backup and rollback safety
+- Profile save and load support
 
-- 🧩 Interactive VLAN setup  
-- 📶 Per-VLAN Wi-Fi (SSID)  
-- 🔒 Optional client isolation  
-- 🌐 Automatic DHCP + firewall rules  
-- 📡 Multi-radio Wi-Fi support  
-- ⚠️ Built-in validation (prevents bad configs)  
-- 💾 Auto backup + rollback safety  
-- 📁 Profile save/load  
+## What It Does
 
----
+For each VLAN, the wizard will:
 
-## ⚙️ What It Does
+- Create a network interface on `192.168.<VLAN>.1/24`
+- Enable a DHCP server
+- Create an isolated firewall zone
+- Allow internet access through WAN forwarding
+- Optionally create a Wi-Fi network on all radios
 
-For each VLAN, the script will:
+## Port Layout
 
-- Create network interface (`192.168.X.1`)
-- Enable DHCP server  
-- Create isolated firewall zone  
-- Allow internet (WAN forwarding)  
-- Optionally create Wi-Fi network  
+- `LAN4` is the tagged trunk port
+- Other LAN ports are access/untagged ports
 
----
-
-## 🔌 Port Layout
-
-- **LAN4 = trunk port (always tagged)**  
-- Other ports = access (untagged)  
-
----
-
-## 📦 Installation
+## CLI Installation
 
 ```bash
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/zippyy/GL.iNet-VLAN-Wizard/main/install.sh)"
+```
+
+## LuCI Plugin Installation
+
+The LuCI web GUI is on the `feature/luci-plugin` branch.
+
+```bash
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/zippyy/GL.iNet-VLAN-Wizard/feature/luci-plugin/install-luci.sh)"
+```
+
+After installation, open LuCI and go to `Network -> VLAN Wizard`.
