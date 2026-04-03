@@ -2,6 +2,7 @@
 
 set -eu
 
+JSON_PREFIX="${JSON_PREFIX-}"
 . /usr/share/libubox/jshn.sh
 
 PROFILE_DIR="/root/vlan_profiles"
