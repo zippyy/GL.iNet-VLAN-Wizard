@@ -37,6 +37,10 @@ function splitWords(value) {
 	return text(value).trim().split(/\s+/).filter(Boolean);
 }
 
+function portDisplayLabel(port) {
+	return port === 'WL' ? _('LAN/WAN') : _('LAN%s').format(port);
+}
+
 function splitConfigs(configs) {
 	return text(configs)
 		.split('|')
@@ -71,7 +75,7 @@ function buildPreview(entries) {
 	return entries.map(function(entry) {
 		return _('VLAN %s').format(entry.vlan || '?') +
 			' | ' + _('Subnet 192.168.%s.0/24').format(entry.vlan || '?') +
-			' | ' + _('Ports: %s').format(entry.untagged || _('trunk only')) +
+			' | ' + _('Ports: %s').format(entry.untagged ? splitWords(entry.untagged).map(portDisplayLabel).join(', ') : _('trunk only')) +
 			' | ' + _('SSID: %s').format(entry.ssid || _('none')) +
 			' | ' + _('Isolation: %s').format(entry.isolation ? _('on') : _('off'));
 	}).join('\n');
@@ -116,7 +120,7 @@ function validateEntries(entries, ports, trunkPort) {
 			errors.push(_('%s: SSID cannot contain ";" or "|".').format(label));
 
 		untaggedPorts.forEach(function(port) {
-			if (!/^\d+$/.test(port)) {
+			if (port !== 'WL' && !/^\d+$/.test(port)) {
 				errors.push(_('%s: Port "%s" is invalid.').format(label, port));
 				return;
 			}
@@ -156,7 +160,7 @@ function countTrunkOnlyEntries(entries) {
 function renderHero(status, entries, trunkPort, ports, profiles) {
 	var tips = [
 		_('Each VLAN gets its own subnet, DHCP scope, firewall zone, and optional Wi-Fi SSID.'),
-		_('LAN%s remains the tagged trunk port and cannot be assigned as an access port.').format(trunkPort),
+		_('%s remains the tagged trunk port and cannot be assigned as an access port.').format(portDisplayLabel(trunkPort)),
 		_('Use saved profiles to reapply repeatable layouts for Guest, IoT, cameras, or lab segments.')
 	];
 	var cards = [
@@ -193,7 +197,7 @@ function renderHero(status, entries, trunkPort, ports, profiles) {
 			]),
 			E('div', { 'class': 'wizard-meta-card' }, [
 				E('strong', {}, _('Trunk port')),
-				E('span', {}, _('LAN%s').format(trunkPort))
+				E('span', {}, portDisplayLabel(trunkPort))
 			]),
 			E('div', { 'class': 'wizard-meta-card' }, [
 				E('strong', {}, _('Wi-Fi radios')),
@@ -305,7 +309,7 @@ return view.extend({
 						'type': 'text',
 						'data-field': 'untagged',
 						'value': text(entry.untagged),
-						'placeholder': _('example: 1 2')
+						'placeholder': _('example: 1 2 or WL')
 					})
 				]),
 				E('label', { 'class': 'vlan-checkbox' }, [
@@ -459,9 +463,9 @@ return view.extend({
 
 		root.appendChild(E('div', { 'class': 'vlan-panel' }, [
 			E('h3', {}, _('Device context')),
-			E('p', { 'class': 'wizard-section-note' }, _('Available LAN access ports are detected from the running device. Assign untagged ports with spaces such as "1 2". Leave SSID blank for a wired-only VLAN, or leave Untagged ports blank for a trunk-only VLAN carried only on LAN%s.').format(trunkPort)),
+			E('p', { 'class': 'wizard-section-note' }, _('Available LAN access ports are detected from the running device. Assign untagged ports with spaces such as "1 2". If the configurable LAN/WAN jack is currently acting as LAN, you can also use "WL". Leave SSID blank for a wired-only VLAN, or leave Untagged ports blank for a trunk-only VLAN carried only on %s.').format(portDisplayLabel(trunkPort))),
 			E('div', { 'class': 'vlan-chip-list' }, ports.length ? ports.map(function(port) {
-				return E('span', { 'class': 'vlan-chip' }, _('LAN%s').format(port));
+				return E('span', { 'class': 'vlan-chip' }, portDisplayLabel(port));
 			}) : [ E('span', { 'class': 'vlan-chip' }, _('No LAN ports detected')) ]),
 			E('div', { 'class': 'vlan-chip-list' }, profiles.length ? profiles.map(function(name) {
 				return E('span', { 'class': 'vlan-chip' }, name);

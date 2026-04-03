@@ -16,6 +16,8 @@ LAN_PORTS=""
 RAW_LAN_PORTS=""
 RAW_TRUNK_PORT=""
 PORT_LABEL_MAP=""
+SWITCHABLE_RAW_PORT=""
+SWITCHABLE_PORT_ENABLED="0"
 RADIOS=""
 VALIDATION_ERRORS=""
 VALIDATION_WARNINGS=""
@@ -143,6 +145,8 @@ detect_swconfig_ports() {
 	RAW_LAN_PORTS=""
 	PORT_LABEL_MAP=""
 	RAW_TRUNK_PORT=""
+	SWITCHABLE_RAW_PORT=""
+	SWITCHABLE_PORT_ENABLED="0"
 
 	for sec in $(uci show network 2>/dev/null | grep "=switch_vlan" | cut -d. -f2 | cut -d= -f1); do
 		vlan_id="$(uci -q get network.$sec.vlan || true)"
@@ -166,6 +170,16 @@ detect_swconfig_ports() {
 			primary_vlan="$vlan_id"
 			primary_ports="$port_list"
 			primary_untagged_count="$untagged_count"
+		elif [ "$name" = "vlan_secondwan" ] || [ "$name" = "secondwan" ]; then
+			for token in $port_list; do
+				case "$token" in
+					*t*) ;;
+					*)
+						SWITCHABLE_RAW_PORT="${token%%[a-zA-Z*]*}"
+						break
+					;;
+				esac
+			done
 		elif [ -z "$primary_ports" ] || [ "$untagged_count" -gt "$primary_untagged_count" ]; then
 			primary_vlan="$vlan_id"
 			primary_ports="$port_list"
@@ -195,6 +209,10 @@ detect_swconfig_ports() {
 						LAN_PORTS="$LAN_PORTS $label_index"
 						label_index=$((label_index + 1))
 					fi
+
+					if [ -n "$SWITCHABLE_RAW_PORT" ] && [ "$base_port" = "$SWITCHABLE_RAW_PORT" ]; then
+						SWITCHABLE_PORT_ENABLED="1"
+					fi
 				;;
 			esac
 		done
@@ -209,6 +227,11 @@ detect_swconfig_ports() {
 
 	RAW_LAN_PORTS="$(trim_spaces "$RAW_LAN_PORTS")"
 	LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
+
+	if [ "$SWITCHABLE_PORT_ENABLED" = "1" ] && [ -n "$SWITCHABLE_RAW_PORT" ]; then
+		PORT_LABEL_MAP="$PORT_LABEL_MAP WL:$SWITCHABLE_RAW_PORT"
+		LAN_PORTS="$(trim_spaces "$LAN_PORTS WL")"
+	fi
 }
 
 detect_lan_ports() {
@@ -370,13 +393,20 @@ validate_configs() {
 		if [ -n "$UNTAG" ]; then
 			for p in $UNTAG; do
 				raw_p="$p"
-
-				case "$p" in
-					''|*[!0-9]*)
-						append_line VALIDATION_ERRORS "VLAN $v has invalid port value: $p"
+				if [ "$MODE" = "swconfig" ] && [ "$p" = "WL" ]; then
+					if ! contains_word "WL" $LAN_PORTS; then
+						append_line VALIDATION_ERRORS "VLAN $v references unknown LAN/WAN port alias: $p"
 						continue
-					;;
-				esac
+					fi
+					raw_p="$(display_port_to_raw "$p")"
+				else
+					case "$p" in
+						''|*[!0-9]*)
+							append_line VALIDATION_ERRORS "VLAN $v has invalid port value: $p"
+							continue
+						;;
+					esac
+				fi
 
 				if [ "$p" = "$TRUNK_PORT" ]; then
 					append_line VALIDATION_ERRORS "VLAN $v uses port $p as untagged, but port $TRUNK_PORT is reserved as trunk"
@@ -392,7 +422,6 @@ validate_configs() {
 						append_line VALIDATION_ERRORS "Port $p is mapped as WAN and cannot be used as LAN"
 					fi
 				else
-					raw_p="$(display_port_to_raw "$p")"
 					if echo " $WAN_IFACES " | grep -q " $raw_p "; then
 						append_line VALIDATION_ERRORS "Port $p may be a WAN-related interface; check mapping"
 					fi
@@ -401,12 +430,12 @@ validate_configs() {
 				for used in $UNTAGGED_USED; do
 					used_port="${used#*:}"
 					used_vlan="${used%%:*}"
-					if [ "$p" = "$used_port" ]; then
+					if [ "$raw_p" = "$used_port" ]; then
 						append_line VALIDATION_ERRORS "Port $p is untagged in multiple VLANs ($used_vlan and $v)"
 					fi
 				done
 
-				UNTAGGED_USED="$UNTAGGED_USED $v:$p"
+				UNTAGGED_USED="$UNTAGGED_USED $v:$raw_p"
 				TOTAL_UNTAGGED_PORTS=$((TOTAL_UNTAGGED_PORTS + 1))
 			done
 		else
