@@ -38,7 +38,7 @@ function splitWords(value) {
 }
 
 function portDisplayLabel(port) {
-	return port === 'WL' ? _('LAN/WAN') : _('LAN%s').format(port);
+	return _('LAN%s').format(port);
 }
 
 function splitConfigs(configs) {
@@ -120,7 +120,7 @@ function validateEntries(entries, ports, trunkPort) {
 			errors.push(_('%s: SSID cannot contain ";" or "|".').format(label));
 
 		untaggedPorts.forEach(function(port) {
-			if (port !== 'WL' && !/^\d+$/.test(port)) {
+			if (!/^\d+$/.test(port)) {
 				errors.push(_('%s: Port "%s" is invalid.').format(label, port));
 				return;
 			}
@@ -309,7 +309,7 @@ return view.extend({
 						'type': 'text',
 						'data-field': 'untagged',
 						'value': text(entry.untagged),
-						'placeholder': _('example: 1 2 or WL')
+						'placeholder': _('example: 2 3')
 					})
 				]),
 				E('label', { 'class': 'vlan-checkbox' }, [
@@ -463,7 +463,7 @@ return view.extend({
 
 		root.appendChild(E('div', { 'class': 'vlan-panel' }, [
 			E('h3', {}, _('Device context')),
-			E('p', { 'class': 'wizard-section-note' }, _('Available LAN access ports are detected from the running device. Assign untagged ports with spaces such as "1 2". If the configurable LAN/WAN jack is currently acting as LAN, you can also use "WL". Leave SSID blank for a wired-only VLAN, or leave Untagged ports blank for a trunk-only VLAN carried only on %s.').format(portDisplayLabel(trunkPort))),
+			E('p', { 'class': 'wizard-section-note' }, _('Available LAN access ports are detected from the running device. Assign untagged ports with spaces such as "2 3". If the configurable LAN/WAN jack is currently acting as LAN, it will appear here as LAN1 automatically. Leave SSID blank for a wired-only VLAN, or leave Untagged ports blank for a trunk-only VLAN carried only on %s.').format(portDisplayLabel(trunkPort))),
 			E('div', { 'class': 'vlan-chip-list' }, ports.length ? ports.map(function(port) {
 				return E('span', { 'class': 'vlan-chip' }, portDisplayLabel(port));
 			}) : [ E('span', { 'class': 'vlan-chip' }, _('No LAN ports detected')) ]),

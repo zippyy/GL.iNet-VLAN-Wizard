@@ -140,7 +140,8 @@ detect_swconfig_ports() {
 	primary_vlan=""
 	primary_ports=""
 	primary_untagged_count=0
-	label_index=1
+	primary_access_raw=""
+	raw_token_count=0
 
 	RAW_LAN_PORTS=""
 	PORT_LABEL_MAP=""
@@ -193,23 +194,20 @@ detect_swconfig_ports() {
 
 	if [ -n "$primary_ports" ]; then
 		LAN_PORTS=""
+		RAW_LAN_PORTS=""
+		PORT_LABEL_MAP=""
+		RAW_TRUNK_PORT=""
+		primary_access_raw=""
 
 		for token in $primary_ports; do
 			base_port="${token%%[a-zA-Z*]*}"
 			[ -n "$base_port" ] || continue
+			raw_token_count=$((raw_token_count + 1))
 
 			case "$token" in
-				*t*)
-					RAW_TRUNK_PORT="$base_port"
-				;;
+				*t*) ;;
 				*)
-					if ! contains_word "$base_port" $RAW_LAN_PORTS; then
-						RAW_LAN_PORTS="$RAW_LAN_PORTS $base_port"
-						PORT_LABEL_MAP="$PORT_LABEL_MAP $label_index:$base_port"
-						LAN_PORTS="$LAN_PORTS $label_index"
-						label_index=$((label_index + 1))
-					fi
-
+					primary_access_raw="$primary_access_raw $base_port"
 					if [ -n "$SWITCHABLE_RAW_PORT" ] && [ "$base_port" = "$SWITCHABLE_RAW_PORT" ]; then
 						SWITCHABLE_PORT_ENABLED="1"
 					fi
@@ -217,9 +215,38 @@ detect_swconfig_ports() {
 			esac
 		done
 
-		if [ -n "$RAW_TRUNK_PORT" ]; then
-			PORT_LABEL_MAP="$PORT_LABEL_MAP $label_index:$RAW_TRUNK_PORT"
+		primary_access_raw="$(trim_spaces "$primary_access_raw")"
+
+		if [ -n "$SWITCHABLE_RAW_PORT" ]; then
+			PORT_LABEL_MAP="1:$SWITCHABLE_RAW_PORT"
+			if [ "$SWITCHABLE_PORT_ENABLED" = "1" ]; then
+				LAN_PORTS="1"
+				RAW_LAN_PORTS="$SWITCHABLE_RAW_PORT"
+			fi
+		fi
+
+		label_index=2
+		for raw_port in $primary_access_raw; do
+			if [ -n "$SWITCHABLE_RAW_PORT" ] && [ "$raw_port" = "$SWITCHABLE_RAW_PORT" ]; then
+				continue
+			fi
+
+			PORT_LABEL_MAP="$PORT_LABEL_MAP $label_index:$raw_port"
+			RAW_TRUNK_PORT="$raw_port"
 			TRUNK_PORT="$label_index"
+			label_index=$((label_index + 1))
+		done
+
+		if [ -n "$TRUNK_PORT" ]; then
+			for label in 2 3 4 5 6; do
+				if [ "$label" != "$TRUNK_PORT" ]; then
+					raw_label_port="$(display_port_to_raw "$label")"
+					if [ -n "$raw_label_port" ] && [ "$raw_label_port" != "$label" ]; then
+						LAN_PORTS="$LAN_PORTS $label"
+						RAW_LAN_PORTS="$RAW_LAN_PORTS $raw_label_port"
+					fi
+				fi
+			done
 		else
 			TRUNK_PORT="4"
 		fi
@@ -227,11 +254,6 @@ detect_swconfig_ports() {
 
 	RAW_LAN_PORTS="$(trim_spaces "$RAW_LAN_PORTS")"
 	LAN_PORTS="$(trim_spaces "$LAN_PORTS")"
-
-	if [ "$SWITCHABLE_PORT_ENABLED" = "1" ] && [ -n "$SWITCHABLE_RAW_PORT" ]; then
-		PORT_LABEL_MAP="$PORT_LABEL_MAP WL:$SWITCHABLE_RAW_PORT"
-		LAN_PORTS="$(trim_spaces "$LAN_PORTS WL")"
-	fi
 }
 
 detect_lan_ports() {
